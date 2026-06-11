@@ -1,0 +1,31 @@
+{
+  "name": "pi-lsp",
+  "version": "2.0.0",
+  "description": "Instant tree-sitter syntax diagnostics for Pi coding agent — 80+ languages, sub-ms parses, auto-checks after every edit",
+  "keywords": ["pi-package", "tree-sitter", "lsp", "diagnostics", "syntax", "parser"],
+  "license": "MIT",
+  "author": "karutoil",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/karutoil/pi-lsp"
+  },
+  "homepage": "https://github.com/karutoil/pi-lsp#readme",
+  "bugs": {
+    "url": "https://github.com/karutoil/pi-lsp/issues"
+  },
+  "main": "extensions/index.ts",
+  "dependencies": {
+    "web-tree-sitter": "^0.26.9",
+    "tree-sitter-wasm": "^1.0.7"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": ["./extensions"],
+    "image": "https://raw.githubusercontent.com/karutoil/pi-lsp/main/pi-lsp.png"
+  }
+}
