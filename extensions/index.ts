@@ -28,10 +28,31 @@ interface Diagnostic {
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-// Resolve grammar dir relative to this extension's node_modules.
-// Works both in ~/.pi/agent/extensions/pi-lsp/ (local) and npm package installs.
-const EXT_DIR = dirname(fileURLToPath(import.meta.url));
-const GRAMMAR_DIR = join(EXT_DIR, "..", "node_modules", "tree-sitter-wasm", "out");
+// Resolve grammar dir — try multiple locations to work across install methods:
+// 1. npm package: node_modules is sibling to extensions/ dir
+// 2. Local dir: node_modules is in the extension root dir
+// 3. Fallback: search parent directories
+function findGrammarDir(): string {
+  const candidates = [
+    // npm package layout: extensions/../node_modules/
+    join(dirname(fileURLToPath(import.meta.url)), "..", "node_modules", "tree-sitter-wasm", "out"),
+    // Local extension dir: ./node_modules/ (same dir as index.ts)
+    join(dirname(fileURLToPath(import.meta.url)), "node_modules", "tree-sitter-wasm", "out"),
+  ];
+  for (const dir of candidates) {
+    if (existsSync(join(dir, "typescript", "tree-sitter-typescript.wasm"))) return dir;
+  }
+  // Fallback: walk up looking for node_modules/tree-sitter-wasm
+  let dir = dirname(fileURLToPath(import.meta.url));
+  for (let i = 0; i < 5; i++) {
+    const candidate = join(dir, "node_modules", "tree-sitter-wasm", "out");
+    if (existsSync(join(candidate, "typescript", "tree-sitter-typescript.wasm"))) return candidate;
+    dir = join(dir, "..");
+  }
+  return candidates[0]; // Return first candidate even if missing (will error later with clear message)
+}
+
+const GRAMMAR_DIR = findGrammarDir();
 
 // File extension → tree-sitter grammar directory name
 const EXT_TO_LANG: Record<string, string> = {
@@ -256,13 +277,19 @@ export default function piLspExtension(pi: ExtensionAPI) {
     currentCwd = ctx.cwd;
 
     // 1. Ensure npm dependencies are installed
-    const extDir = join(EXT_DIR, "..");
-    if (!existsSync(join(extDir, "node_modules"))) {
+    const extDir = dirname(fileURLToPath(import.meta.url));
+    // Walk up to find the package root (where node_modules should live)
+    let pkgRoot = extDir;
+    for (let i = 0; i < 3; i++) {
+      if (existsSync(join(pkgRoot, "package.json"))) break;
+      pkgRoot = join(pkgRoot, "..");
+    }
+    if (!existsSync(join(pkgRoot, "node_modules"))) {
       ctx.ui.setStatus("pi-lsp", "Installing deps...");
       const { execFile } = await import("node:child_process");
       const run = (await import("node:util")).promisify(execFile);
       try {
-        await run("npm", ["install", "--omit=dev"], { cwd: extDir, timeout: 120_000 });
+        await run("npm", ["install", "--omit=dev"], { cwd: pkgRoot, timeout: 120_000 });
         ctx.ui.notify("pi-lsp: Dependencies installed", "info");
       } catch (err: any) {
         ctx.ui.notify(`pi-lsp: npm install failed — ${err.message}`, "error");
