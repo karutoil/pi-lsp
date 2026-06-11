@@ -12,13 +12,13 @@
 ## Install
 
 ```bash
-pi install npm:pi-lsp
+pi install npm:@karutoil/pi-lsp
 ```
 
 Or try without installing:
 
 ```bash
-pi -e npm:pi-lsp
+pi -e npm:@karutoil/pi-lsp
 ```
 
 ## What It Does
