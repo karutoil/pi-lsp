@@ -1,0 +1,26 @@
+name: Publish to npm
+
+on:
+  push:
+    tags: ["v*"]            # publish only on version tags
+  workflow_dispatch:         # manual trigger from Actions tab
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write        # enables OIDC token for npm trusted publishing
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - run: npm ci
+
+      - run: npm publish --provenance --access public
+        # No NPM_TOKEN needed — OIDC authenticates directly

@@ -10,9 +10,12 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { join, extname, resolve, dirname } from "node:path";
+import { join, extname, resolve, dirname, relative } from "node:path";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { SymbolIndex, extractSymbols, extractReferences, resolveLocalDefinition, getHoverInfo, classifyNode } from "./queries";
+import type { SymbolInfo } from "./queries";
+import { runTypeCheck } from "./typecheck";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -233,14 +236,8 @@ async function parseFile(filePath: string): Promise<{ diagnostics: Diagnostic[];
   parser.setLanguage(language);
   const tree = parser.parse(source);
 
-  if (!tree.rootNode.hasError) {
-    tree.delete();
-    return { diagnostics: [], language: langDir };
-  }
-
   const diagnostics = extractDiagnostics(tree.rootNode, source);
-  tree.delete();
-  return { diagnostics, language: langDir };
+  return { diagnostics, language: langDir, tree };
 }
 
 function formatDiagnostics(filePath: string, result: { diagnostics: Diagnostic[]; language: string }): string {
@@ -270,6 +267,7 @@ function formatDiagnostics(filePath: string, result: { diagnostics: Diagnostic[]
 export default function piLspExtension(pi: ExtensionAPI) {
   let currentCwd = "";
   let parserReady = false;
+  const symbolIndex = new SymbolIndex();
 
   // ── Session lifecycle ─────────────────────────────────────────────────────
 
@@ -357,6 +355,11 @@ export default function piLspExtension(pi: ExtensionAPI) {
     try {
       const result = await parseFile(filePath);
       if (!result) return;
+
+      // Update symbol index with fresh parse
+      if (result.tree) {
+        symbolIndex.indexFile(filePath, result.tree);
+      }
 
       // Only notify the agent if there are actual errors
       if (result.diagnostics.length > 0) {
@@ -593,6 +596,312 @@ export default function piLspExtension(pi: ExtensionAPI) {
   // ── File diagnostics tool (already registered above, keeping for clarity) ───
   // (lsp_diagnostics is registered above)
 
+  // ── Document symbols tool ──────────────────────────────────────────────────
+
+  pi.registerTool({
+    name: "lsp_symbols",
+    label: "Document Symbols",
+    description:
+      "List all symbols (functions, classes, variables, etc.) in a file. " +
+      "Uses tree-sitter to extract symbol names, kinds, and locations. " +
+      "Works for all 80+ supported languages.",
+    promptSnippet: "List symbols in a file",
+    promptGuidelines: [
+      "Use lsp_symbols to get a high-level overview of a file's structure — functions, classes, variables.",
+      "Helps understand the codebase quickly without reading the entire file.",
+    ],
+    parameters: Type.Object({
+      path: Type.String({ description: "File path" }),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      try {
+      if (!parserReady) {
+        return { content: [{ type: "text", text: "Parser not ready yet." }], details: {} };
+      }
+      const filePath = params.path.startsWith("/")
+        ? params.path
+        : resolve(ctx.cwd, params.path);
+      if (!existsSync(filePath)) {
+        return { content: [{ type: "text", text: `File not found: ${params.path}` }], details: {} };
+      }
+      const result = await parseFile(filePath);
+      if (!result || !result.tree) {
+        return { content: [{ type: "text", text: `Could not parse: ${params.path}` }], details: {} };
+      }
+      symbolIndex.indexFile(filePath, result.tree);
+      const symbols = extractSymbols(result.tree, filePath);
+      if (symbols.length === 0) {
+        return { content: [{ type: "text", text: `No symbols found in ${params.path}` }], details: {} };
+      }
+      const byKind = new Map<string, SymbolInfo[]>();
+      for (const s of symbols) {
+        const list = byKind.get(s.kind) ?? [];
+        list.push(s);
+        byKind.set(s.kind, list);
+      }
+      const lines = [`📋 ${symbols.length} symbols in ${params.path}:`, ""];
+      for (const [kind, syms] of [...byKind].sort()) {
+        lines.push(`  **${kind}** (${syms.length}):`);
+        for (const s of syms) {
+          const scope = s.containerName ? ` (in ${s.containerName})` : "";
+          lines.push(`    L${s.line}:${s.column} — \`${s.name}\`${scope}`);
+        }
+      }
+      return {
+        content: [{ type: "text", text: lines.join("\n") }],
+        details: { symbols, file: filePath },
+      };
+      } catch (err: any) { return { content: [{ type: "text", text: `lsp_symbols error: ${err.message}` }], details: {} }; }
+    },
+  });
+
+  // ── Go to definition tool ──────────────────────────────────────────────────
+
+  pi.registerTool({
+    name: "lsp_definition",
+    label: "Go to Definition",
+    description:
+      "Find the definition of a symbol at a given line/column. " +
+      "Resolves within the same file using tree-sitter scope analysis. " +
+      "For cross-file results, use after indexing the project.",
+    promptSnippet: "Find where a symbol is defined",
+    promptGuidelines: [
+      "Use lsp_definition to find where a function, class, or variable is defined.",
+      "Place the cursor on a symbol name and pass its line/column to this tool.",
+      "Currently resolves within the same file. For cross-file, ensure the project has been scanned.",
+    ],
+    parameters: Type.Object({
+      path: Type.String({ description: "File path" }),
+      line: Type.Number({ description: "Line number (1-indexed)" }),
+      column: Type.Number({ description: "Column number (1-indexed)" }),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      try {
+      if (!parserReady) {
+        return { content: [{ type: "text", text: "Parser not ready yet." }], details: {} };
+      }
+      const filePath = params.path.startsWith("/")
+        ? params.path
+        : resolve(ctx.cwd, params.path);
+      const result = await parseFile(filePath);
+      if (!result || !result.tree) {
+        return { content: [{ type: "text", text: `Could not parse: ${params.path}` }], details: {} };
+      }
+      symbolIndex.indexFile(filePath, result.tree);
+
+      // Try local scope resolution
+      const localDef = resolveLocalDefinition(result.tree, params.line, params.column);
+      if (localDef) {
+        return {
+          content: [{ type: "text", text: `✅ \`${localDef.name}\` (${localDef.kind}) → L${localDef.line}:${localDef.column}${localDef.containerName ? ` in ${localDef.containerName}` : ""}` }],
+          details: { definition: localDef },
+        };
+      }
+
+      // Try cross-file via symbol index
+      const node = result.tree.rootNode.namedDescendantForPosition({ row: params.line - 1, column: params.column - 1 });
+      if (node && node.text) {
+        const name = node.text;
+        const defs = symbolIndex.findDefinitions(name);
+        const otherFileDefs = defs.filter((d: SymbolInfo) => d.file !== filePath);
+        if (otherFileDefs.length > 0) {
+          const d = otherFileDefs[0];
+          return {
+            content: [{ type: "text", text: `✅ \`${name}\` (${d.kind}) → ${d.file}:L${d.line}:${d.column}` }],
+            details: { definition: d, candidates: otherFileDefs.slice(0, 10) },
+          };
+        }
+        if (defs.length > 0) {
+          const d = defs[0];
+          return {
+            content: [{ type: "text", text: `✅ \`${name}\` (${d.kind}) → L${d.line}:${d.column} (same file)` }],
+            details: { definition: d },
+          };
+        }
+      }
+
+      return {
+        content: [{ type: "text", text: `No definition found at L${params.line}:${params.column}` }],
+        details: {},
+      };
+      } catch (err: any) { return { content: [{ type: "text", text: `lsp_definition error: ${err.message}` }], details: {} }; }
+    },
+  });
+
+  // ── Find references tool ───────────────────────────────────────────────────
+
+  pi.registerTool({
+    name: "lsp_references",
+    label: "Find References",
+    description:
+      "Find all references to a symbol within a file. " +
+      "Uses tree-sitter to find all identifier nodes matching the given name.",
+    promptSnippet: "Find all usages of a symbol in a file",
+    promptGuidelines: [
+      "Use lsp_references to see where a symbol is used throughout a file.",
+      "Place the cursor on a symbol and pass its file, line, and column.",
+    ],
+    parameters: Type.Object({
+      path: Type.String({ description: "File path" }),
+      line: Type.Number({ description: "Line number (1-indexed)" }),
+      column: Type.Number({ description: "Column number (1-indexed)" }),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      try {
+      if (!parserReady) {
+        return { content: [{ type: "text", text: "Parser not ready yet." }], details: {} };
+      }
+      const filePath = params.path.startsWith("/")
+        ? params.path
+        : resolve(ctx.cwd, params.path);
+      const result = await parseFile(filePath);
+      if (!result || !result.tree) {
+        return { content: [{ type: "text", text: `Could not parse: ${params.path}` }], details: {} };
+      }
+      symbolIndex.indexFile(filePath, result.tree);
+
+      const node = result.tree.rootNode.namedDescendantForPosition({ row: params.line - 1, column: params.column - 1 });
+      if (!node || !node.text) {
+        return { content: [{ type: "text", text: `No symbol at L${params.line}:${params.column}` }], details: {} };
+      }
+
+      const refs = extractReferences(result.tree, node.text);
+      const lines: string[] = [];
+      if (refs.length === 0) {
+        lines.push(`No references to \`${node.text}\` found`);
+      } else {
+        lines.push(`📌 ${refs.length} reference(s) to \`${node.text}\`:`);
+        for (const r of refs.slice(0, 50)) {
+          const marker = r.line === params.line && r.column === params.column ? "📍" : "  ";
+          lines.push(`  ${marker} L${r.line}:${r.column} — in ${r.context}`);
+        }
+        if (refs.length > 50) {
+          lines.push(`  ... and ${refs.length - 50} more`);
+        }
+      }
+      return {
+        content: [{ type: "text", text: lines.join("\n") }],
+        details: { references: refs, target: node.text, file: filePath },
+      };
+      } catch (err: any) { return { content: [{ type: "text", text: `lsp_references error: ${err.message}` }], details: {} }; }
+    },
+  });
+
+  // ── Hover tool ─────────────────────────────────────────────────────────────
+
+  pi.registerTool({
+    name: "lsp_hover",
+    label: "Hover Info",
+    description:
+      "Get information about the symbol or node at a given position. " +
+      "Shows the node type, text snippet, and definition kind if applicable.",
+    promptSnippet: "Get info about a symbol at the cursor",
+    promptGuidelines: [
+      "Use lsp_hover to inspect what's at a specific position in a file.",
+      "Useful for understanding code structure without reading the full file.",
+    ],
+    parameters: Type.Object({
+      path: Type.String({ description: "File path" }),
+      line: Type.Number({ description: "Line number (1-indexed)" }),
+      column: Type.Number({ description: "Column number (1-indexed)" }),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      try {
+      if (!parserReady) {
+        return { content: [{ type: "text", text: "Parser not ready yet." }], details: {} };
+      }
+      const filePath = params.path.startsWith("/")
+        ? params.path
+        : resolve(ctx.cwd, params.path);
+      const result = await parseFile(filePath);
+      if (!result || !result.tree) {
+        return { content: [{ type: "text", text: `Could not parse: ${params.path}` }], details: {} };
+      }
+      symbolIndex.indexFile(filePath, result.tree);
+
+      const hover = getHoverInfo(result.tree, params.line, params.column);
+      if (!hover) {
+        return { content: [{ type: "text", text: `Nothing at L${params.line}:${params.column}` }], details: {} };
+      }
+      return { content: [{ type: "text", text: hover }], details: {} };
+      } catch (err: any) { return { content: [{ type: "text", text: `lsp_hover error: ${err.message}` }], details: {} }; }
+    },
+  });
+
+  // ── Type check tool ───────────────────────────────────────────────────────
+
+  pi.registerTool({
+    name: "run_type_check",
+    label: "Run Type Checker",
+    description:
+      "Run the project's type checker / compiler to find semantic errors " +
+      "that tree-sitter cannot detect (type mismatches, missing imports, etc.). " +
+      "Auto-detects project type (TypeScript, Rust, Go, Python, etc.) and " +
+      "runs the appropriate command (tsc --noEmit, cargo check, go build, etc.). " +
+      "Accepts an optional custom command override.",
+    promptSnippet: "Run compiler/type checker to catch semantic errors",
+    promptGuidelines: [
+      "Before declaring any coding task complete, run run_type_check to catch type errors and semantic issues.",
+      "If run_type_check returns errors, fix them and re-run until clean.",
+      "Use this after tree-sitter syntax checks pass — it catches type errors that tree-sitter cannot.",
+      "For projects without a detected build system, pass a custom command.",
+    ],
+    parameters: Type.Object({
+      path: Type.Optional(Type.String({ description: "Directory to check (default: cwd)" })),
+      timeout: Type.Optional(Type.Number({ description: "Max seconds to wait (default: 60)" })),
+      command: Type.Optional(Type.String({ description: "Custom command to run (overrides auto-detection)" })),
+      args: Type.Optional(Type.Array(Type.String(), { description: "Arguments for the custom command" })),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const cwd = params.path
+        ? (params.path.startsWith("/") ? params.path : resolve(ctx.cwd, params.path))
+        : ctx.cwd;
+
+      _onUpdate?.({ content: [{ type: "text", text: "Running type check..." }] });
+
+      const result = await runTypeCheck(cwd, {
+        timeout: params.timeout ?? 60,
+        command: params.command,
+        args: params.args,
+      });
+
+      if (result.error && result.diagnostics.length === 0) {
+        const msg = result.error.includes("No check command") || result.error.includes("No project type")
+          ? `⚠️ ${result.error}`
+          : `❌ Check failed: ${result.error}`;
+        return { content: [{ type: "text", text: msg }], details: result };
+      }
+
+      if (result.timedOut) {
+        return {
+          content: [{ type: "text", text: `⏱️ Type check timed out after ${params.timeout ?? 60}s` }],
+          details: result,
+        };
+      }
+
+      if (result.diagnostics.length === 0) {
+        return {
+          content: [{ type: "text", text: `✅ Type check passed — ${result.projectType ? `detected ${result.projectType}, ` : ""}${result.command}` }],
+          details: result,
+        };
+      }
+
+      const lines = [`🔍 ${result.diagnostics.length} issue(s) found by ${result.command}:`, ""];
+      for (const d of result.diagnostics.slice(0, 50)) {
+        const icon = d.severity === "error" ? "❌" : "⚠️";
+        lines.push(`  ${icon} L${d.line}:${d.column} — ${d.message}`);
+      }
+      if (result.diagnostics.length > 50) {
+        lines.push(`  ... and ${result.diagnostics.length - 50} more`);
+      }
+
+      return {
+        content: [{ type: "text", text: lines.join("\n") }],
+        details: result,
+      };
+    },
+  });
+
   // ── Commands ──────────────────────────────────────────────────────────────
 
   pi.registerCommand("lsp-status", {
@@ -604,6 +913,8 @@ export default function piLspExtension(pi: ExtensionAPI) {
         lines.push("Parser:   ✓ web-tree-sitter loaded");
         lines.push(`Grammars: ${languageCache.size} loaded, ${Object.keys(EXT_TO_LANG).length} supported`);
         lines.push(`Languages: ${[...new Set(Object.values(EXT_TO_LANG))].sort().join(", ")}`);
+        lines.push(`Symbols:  ${symbolIndex.getSymbolCount()} symbols indexed in ${symbolIndex.getFileCount()} files`);
+        lines.push("Type check: auto-detect (/check to run)");
       } else {
         lines.push("Parser:   ⏳ loading...");
       }
@@ -676,6 +987,46 @@ export default function piLspExtension(pi: ExtensionAPI) {
 
       const msg = formatProjectResults(ctx.cwd, results, totalFiles, totalFiles);
       ctx.ui.notify(msg, results.length > 0 ? "error" : "info");
+    },
+  });
+
+  pi.registerCommand("symbols", {
+    description: "Show document symbols for a file",
+    getArgumentCompletions: (prefix: string) => {
+      const suggestions = ["src/", "lib/", "."];
+      return suggestions
+        .filter((s) => s.startsWith(prefix))
+        .map((s) => ({ value: s, label: s, description: "file or directory" }));
+    },
+    handler: async (args, ctx) => {
+      if (!parserReady) {
+        ctx.ui.notify("Parser not ready yet", "warning");
+        return;
+      }
+      ctx.ui.notify(
+        `Symbol index: ${symbolIndex.getSymbolCount()} symbols in ${symbolIndex.getFileCount()} files`,
+        "info",
+      );
+    },
+  });
+
+  pi.registerCommand("check", {
+    description: "Run language type checker on the project",
+    handler: async (_args, ctx) => {
+      ctx.ui.setStatus("pi-lsp", "Running type check...");
+      const result = await runTypeCheck(ctx.cwd, { timeout: 120 });
+      ctx.ui.setStatus("pi-lsp", "● Ready");
+
+      if (result.error && result.diagnostics.length === 0) {
+        ctx.ui.notify(`⚠️ ${result.error}`, "warning");
+        return;
+      }
+
+      const msg = result.diagnostics.length === 0
+        ? `✅ Type check passed — ${result.command}`
+        : `❌ ${result.diagnostics.length} type error(s) found`;
+
+      ctx.ui.notify(msg, result.diagnostics.length > 0 ? "error" : "info");
     },
   });
 }
