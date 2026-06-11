@@ -1,3 +1,5 @@
+.pi/
+node_modules/
 src/
 test/
 *.test.ts
@@ -5,3 +7,6 @@ test/
 .eslint*
 .prettier*
 tsconfig.json
+.git/
+.gitignore
+.github/

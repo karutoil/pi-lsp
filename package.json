@@ -1,5 +1,5 @@
 {
-  "name": "pi-lsp",
+  "name": "@karutoil/pi-lsp",
   "version": "2.0.0",
   "description": "Instant tree-sitter syntax diagnostics for Pi coding agent — 80+ languages, sub-ms parses, auto-checks after every edit",
   "keywords": ["pi-package", "tree-sitter", "lsp", "diagnostics", "syntax", "parser"],
